@@ -1,5 +1,7 @@
 #include"includes.h"
 
+#define MAX_EVENTS 10000
+
 typedef struct{
     char method[8];
     char path[256];
@@ -93,120 +95,120 @@ static int vServeData(const char *req_path, char *response_buf, size_t buf_size)
     return n + filesize;
 }
 
+void vNonBlocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+
 //------------------------------------------------------------
 // Function : vRunHttpServer()
 //------------------------------------------------------------
 void vRunHttpServer(int port)
 {
-    int sfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sfd < 0) {
-        perror("fail to create socket");
-        return;
+    int sfd =socket(AF_INET,SOCK_STREAM,0);
+    if(sfd < 0)
+    {
+        perror("fail to create socket\n");
     }
-
-    int opt =1;
+    int opt=1;
     setsockopt(sfd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
 
-    struct sockaddr_in serverInfo = {0};
-    serverInfo.sin_family = AF_INET;
-    serverInfo.sin_port = htons(port);
-    serverInfo.sin_addr.s_addr = INADDR_ANY;
+    struct sockaddr_in serverInfo ={0};
+    serverInfo.sin_addr.s_addr=INADDR_ANY;
+    serverInfo.sin_family=AF_INET;
+    serverInfo.sin_port=htons(port);
 
-    // bind
-    if (bind(sfd, (struct sockaddr *)&serverInfo, sizeof(serverInfo)) < 0) {
-        perror("bind fail");
+    if(bind(sfd,(struct sockaddr *)&serverInfo,sizeof(serverInfo)) < 0)
+    {
+        perror("bind fail\n");
         close(sfd);
         return;
     }
-
-    // listen
-    if (listen(sfd, 5) == -1) {
+    if(listen(sfd,128) < 0)
+    {
         perror("listen fail");
         close(sfd);
         return;
     }
+    // for non-blocking
+    vNonBlocking(sfd);
 
-    struct pollfd fds[MAX_CLIENT + 1];
-    int nfds = 1;
-
-    fds[0].fd = sfd;
-    fds[0].events = POLLIN;
-
-    for (int i = 1; i <= MAX_CLIENT; i++) {
-        fds[i].fd = -1;
+    int epfd = epoll_create1(0);
+    if(epfd < 0)
+    {
+        perror("epoll create fail\n");
+        close(sfd);
+        return;
     }
 
-    printf("Server listening on port 5555...\n");
+    struct epoll_event ev,events[MAX_EVENTS];
+    ev.events = EPOLLIN;
+    ev.data.fd =sfd;
+    epoll_ctl(epfd,EPOLL_CTL_ADD,sfd,&ev);
 
     char buffer[BUFFER_SIZE];
-    struct sockaddr_in clientInfo;
+    printf("Server listening on port %d...\n", port);
 
-    while (1) {
-        int activity = poll(fds, nfds, -1);
-        if (activity < 0) {
-            perror("poll error");
+    while(1)
+    {
+        int nfds = epoll_wait(epfd,events,MAX_EVENTS,-1);
+        if(nfds < 0)
+        {
+            perror("epoll_wait fail\n");
             break;
         }
 
-        // check for new connection
-        if (fds[0].revents & POLLIN) {
-            socklen_t clientsize = sizeof(clientInfo);
-            int new_fd = accept(sfd, (struct sockaddr *)&clientInfo, &clientsize);
-            if (new_fd < 0) {
-                perror("accept fail");
-                continue;
-            }
-
-            printf("New client connected: FD %d\n", new_fd);
-
-            int added = 0;
-            for (int i = 1; i <= MAX_CLIENT; i++) {
-                if (fds[i].fd == -1) {
-                    fds[i].fd = new_fd;
-                    fds[i].events = POLLIN;
-                    if (i >= nfds) nfds = i + 1;
-                    added = 1;
-                    break;
+        for(int i=0;i<nfds;i++)
+        {
+            int fd = events[i].data.fd;
+            if(fd == sfd)
+            {
+                struct sockaddr_in clientInfo;
+                socklen_t clientLen = sizeof(clientInfo);
+                int client_fd = accept(sfd,(struct sockaddr *)&clientInfo,&clientLen);
+                if(client_fd < 0)
+                {
+                    perror("accept");
+                    continue;
                 }
+                vNonBlocking(client_fd);
+                ev.events = EPOLLIN | EPOLLET;
+                ev.data.fd = client_fd;
+                epoll_ctl(epfd,EPOLL_CTL_ADD,client_fd,&ev);
+                printf("New client connected: FD %d\n", client_fd);
             }
-
-            if (!added) {
-                printf("Too many clients. Connection rejected.\n");
-                close(new_fd);
-            }
-        }
-
-        // check all client sockets
-        for (int i = 1; i < nfds; i++) {
-            if (fds[i].fd != -1 && (fds[i].revents & POLLIN)) {
-                int bytes = read(fds[i].fd, buffer, sizeof(buffer));
-                if (bytes <= 0) {
-                    printf("Client disconnected: FD %d\n", fds[i].fd);
-                    close(fds[i].fd);
-                    fds[i].fd = -1;
-                } else {
+            else
+            {
+                int bytes = read(fd,buffer,sizeof(buffer) -1);
+                if(bytes < 0)
+                {
+                    printf("Client disconnected: FD %d\n", fd);
+                    close(fd);
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+                }
+                else
+                {
                     buffer[bytes] = '\0';
-                    printf("Data from FD %d: %s", fds[i].fd, buffer);
+                    printf("Data from FD %d: %s", fd, buffer);
 
                     vHttpRequest_t req;
-                    if(vParseHttpRequest(buffer,&req) == 0 && strcmp(req.method,"GET") == 0)
+                    if (vParseHttpRequest(buffer, &req) == 0 && strcmp(req.method, "GET") == 0)
                     {
-                        char response[BUFFER_SIZE *2];
-                        int resp_len = vServeData(req.path,response,sizeof(response));
-                         send(fds[i].fd, response,resp_len, 0);
-
+                        char response[BUFFER_SIZE * 2];
+                        int resp_len = vServeData(req.path, response, sizeof(response));
+                        send(fd, response, resp_len, 0);
                     }
                     else
                     {
-                        const char *bad_req =HTTP_ERR_STR;
-                        send(fds[i].fd,bad_req,strlen(bad_req), 0);
+                        send(fd, HTTP_ERR_STR, strlen(HTTP_ERR_STR), 0);
                     }
                 }
             }
         }
     }
+   close(sfd);
 
-    close(sfd);
 }
 
 

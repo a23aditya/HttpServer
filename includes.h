@@ -10,6 +10,8 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/epoll.h>
+#include <signal.h>
 
 #define PORT_NO             5555
 #define MAX_CLIENT          10
